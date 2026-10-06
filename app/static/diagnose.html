@@ -47,6 +47,19 @@
     <p class="hint">电压电流均须为有限非负数（电压可为零，且不超过所选记录的基线开路电压）；
       每个测点 |实测电流 − 理论电流| ≤ 容差才算被假设解释。</p>
 
+    <h3>批量录入（可选）</h3>
+    <p class="hint">每行一个测点，格式 <code>V,I</code>（空白或逗号分隔，<code>#</code>
+      开头为注释，可直接粘贴上千行）；点击下方按钮按行解析并填充上表，
+      再点“提交诊断”即可批量诊断。</p>
+    <div class="form-row">
+      <textarea id="bulkPoints" rows="5" style="width:100%;font-family:monospace"
+        placeholder="# 例如（可粘贴成百上千行）&#10;0.00, 29.97&#10;40.00, 5.91&#10;90.00, 0"></textarea>
+    </div>
+    <div class="btn-row">
+      <button type="button" id="bulkLoadBtn">解析批量测点并填入上表</button>
+      <span id="bulkMsg" class="hint"></span>
+    </div>
+
     <div class="btn-row main-actions">
       <button type="button" id="diagnoseBtn" class="primary">提交诊断</button>
       <span id="diagError" class="error" hidden></span>

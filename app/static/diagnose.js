@@ -189,6 +189,48 @@ function renderDiagnosis(d) {
   $("#diagResultCard").scrollIntoView?.({ behavior: "smooth" });
 }
 
+/* ---------------- 批量录入 ---------------- */
+
+function parseBulkPoints(text) {
+  const out = [];
+  const errors = [];
+  text.split(/\r?\n/).forEach((raw, idx) => {
+    const line = raw.replace(/#.*$/, "").trim();
+    if (!line) return;
+    const parts = line.split(/[\s,;，；\t]+/).filter((s) => s !== "");
+    if (parts.length !== 2
+        || Number.isNaN(Number(parts[0])) || Number.isNaN(Number(parts[1]))) {
+      errors.push(`第 ${idx + 1} 行格式错误（应为 “V,I”）：${raw.trim()}`);
+      return;
+    }
+    out.push({ v: parts[0], i: parts[1] });
+  });
+  return { out, errors };
+}
+
+function loadBulkPoints() {
+  const msg = $("#bulkMsg");
+  const { out, errors } = parseBulkPoints($("#bulkPoints").value);
+  if (errors.length) {
+    msg.textContent = `✗ ${errors.slice(0, 3).join("；")}`
+      + (errors.length > 3 ? ` 等 ${errors.length} 处错误` : "");
+    return;
+  }
+  if (!out.length) {
+    msg.textContent = "✗ 未解析到任何测点";
+    return;
+  }
+  numPoints = Math.max(MIN_POINTS, out.length);
+  tbPoints.innerHTML = ""; // 清空旧行，避免 renderPointRows 保留上次录入
+  renderPointRows();
+  const rows = tbPoints.querySelectorAll("tr");
+  out.forEach((p, idx) => {
+    rows[idx].querySelector(".p-v").value = p.v;
+    rows[idx].querySelector(".p-i").value = p.i;
+  });
+  msg.textContent = `已填入 ${out.length} 个测点，检查容差后点“提交诊断”。`;
+}
+
 /* ---------------- 事件与初始化 ---------------- */
 
 $("#recordSelect").addEventListener("change", (e) => fetchRecordMeta(e.target.value));
@@ -198,6 +240,7 @@ $("#removePointBtn").addEventListener("click", () => {
   numPoints--; renderPointRows();
 });
 $("#diagnoseBtn").addEventListener("click", submitDiagnosis);
+$("#bulkLoadBtn").addEventListener("click", loadBulkPoints);
 
 renderPointRows();
 const prefill = new URLSearchParams(location.search).get("id");

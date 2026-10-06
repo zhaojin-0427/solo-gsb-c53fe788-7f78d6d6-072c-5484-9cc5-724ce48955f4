@@ -12,14 +12,22 @@
 
 拐点处由 ``_segment_at`` 精确选段（分段连续，不会因选段产生跳变）；
 端电压达到某串 Voc 的支路电流为 0、对该串内各组的退化不敏感，
-这些事实由 ``string_current`` / ``total_current`` 精确处理，枚举网格
-无需在拐点上做任何插值。
+这些事实由 ``string_current`` / ``total_current`` 精确处理。
+
+性能：对某组而言，固定测点电压下总理论电流随退化候选 Isc 单调不下降
+（组被旁路或其串已达 Voc 时呈平台），故各测点的可行候选构成一条连续
+0.01 网格带。实现逐测点对**单调谓词**做“两端搜索”（首个达下界、末个
+不超上界），再取各测点可行带的交集；不做逐档曲线重建与逐点枚举，
+也不能对“全部点合格”这一整体谓词直接布尔二分——单调性只保证可行集是
+一条（可能为空的）离散带，整体谓词在带两侧均为假，不满足二分条件。
 """
 
 import math
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
-from .model import Group, MERGE_EPS, string_curve, total_current
+from .model import (
+    Group, MERGE_EPS, StringCurve, string_current, string_curve, total_current,
+)
 
 # 理论电流与实测电流比较时的浮点容差（输入量化到 0.01，远小于物理量纲）
 _EPS = 1e-9
@@ -108,16 +116,125 @@ def _num(x: float) -> str:
     return f"{x:.10f}".rstrip("0").rstrip(".")
 
 
-def _grid_values(isc0: float) -> List[float]:
-    """小于 isc0 的全部正两位小数候选（升序）：0.01, 0.02, ..., < isc0。"""
+def _grid_count(isc0: float) -> int:
+    """小于 isc0 的正两位小数候选个数：候选为 k·0.01, k=1..n（n 即返回值）。"""
     n = int(math.floor(isc0 / GRID + 1e-9))
     if n * GRID >= isc0 - 1e-9:
         n -= 1  # 等档（原 Isc 本身）不属于退化假设
-    return [k * GRID for k in range(1, n + 1)]
+    return max(0, n)
 
 
 def _within(theory: float, measured: float, tol: float) -> bool:
     return abs(theory - measured) <= tol + _EPS
+
+
+class _DegradedStringProbe:
+    """某组退化候选 Isc 下的逐测点理论总电流求值器。
+
+    退化只发生在该组所在的一条串上：其余串曲线与各测点的贡献在整组
+    扫描中恒定，预算一次；退化串的分段曲线按 0.01 网格下标懒构建并缓存
+    （同一网格串曲线只重建一次，供该组全部测点的两端搜索复用）。
+
+    ``total(k)`` 在固定测点电压下对 k（退化 Isc 网格下标）单调不下降，
+    平台对应：退化组在该电压被旁路、或其所在串已达到串 Voc（支路恒为
+    零电流，此时退化不可察觉，实测仍须与该零电流+其余串贡献核对）。
+    """
+
+    __slots__ = ("members", "pos", "other_points", "string_voc", "_cache")
+
+    def __init__(self, base_members: Sequence[Group], pos: int,
+                 other_curves: Sequence[StringCurve],
+                 points: Sequence[tuple]):
+        self.members = list(base_members)
+        self.pos = pos
+        # 其余串在每个测点电压上的电流之和（与退化候选无关）
+        self.other_points = [total_current(other_curves, v)
+                             for v, _ in points]
+        self.string_voc = sum(g.voc for g in self.members)
+        self._cache: dict[int, StringCurve] = {}
+
+    def _curve(self, k: int) -> StringCurve:
+        curve = self._cache.get(k)
+        if curve is None:
+            members = self.members
+            degraded = Group(members[self.pos].id,
+                             members[self.pos].voc, k * GRID)
+            new_members = [
+                degraded if j == self.pos else g
+                for j, g in enumerate(members)
+            ]
+            curve = string_curve(new_members)
+            self._cache[k] = curve
+        return curve
+
+    def total(self, k: int, point_idx: int, v: float) -> float:
+        # 端电压达到（或超过）该串开路电压：支路电流恒为 0，
+        # 与退化候选无关——仍按其余串贡献与实测逐点核对。
+        # 判定与 string_current 的开路选段（_segment_at 返回 None 的
+        # v > voc + MERGE_EPS 及 v 恰等于 voc 时线性段给出 0）保持一致。
+        if v >= self.string_voc - MERGE_EPS:
+            return self.other_points[point_idx]
+        return self.other_points[point_idx] + string_current(self._curve(k), v)
+
+
+def _first_ge(probe: _DegradedStringProbe, pidx: int, v: float,
+              threshold: float, n: int) -> Optional[int]:
+    """最小网格下标 k∈[1,n] 使 total(k) ≥ threshold；不存在返回 None。
+
+    total(k) 对 k 单调不下降（含平台），故用“找下界”二分而非线性扫描。
+    """
+    lo, hi = 1, n + 1  # hi 为越界哨兵：n+1 表示不存在
+    while lo < hi:
+        mid = (lo + hi) >> 1
+        if probe.total(mid, pidx, v) >= threshold - _EPS:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo if lo <= n else None
+
+
+def _last_le(probe: _DegradedStringProbe, pidx: int, v: float,
+             threshold: float, n: int) -> Optional[int]:
+    """最大网格下标 k∈[1,n] 使 total(k) ≤ threshold；不存在返回 None。
+
+    total(k) 对 k 单调不下降（含平台），故用“找上界”二分而非线性扫描。
+    """
+    lo, hi = 0, n  # lo=0 为越界哨兵：0 表示不存在
+    while lo < hi:
+        mid = (lo + hi + 1) >> 1
+        if probe.total(mid, pidx, v) <= threshold + _EPS:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo if lo >= 1 else None
+
+
+def _feasible_band(probe: _DegradedStringProbe,
+                   points: Sequence[tuple], tol: float,
+                   n: int) -> Optional[tuple]:
+    """求该组在全部测点上均合格的连续网格下标带 [lo, hi]；不可行返回 None。
+
+    单测点可行条件 ``|total(k) − I| ≤ tol`` 在单调（含平台）的 total(k)
+    上等价于 ``I−tol ≤ total(k) ≤ I+tol``，可行下标本身也是一条连续带
+    （两端由单调谓词二分定位）；全部测点取交集即整体可行带。
+    不对“全部点合格”做布尔二分：整体谓词仅在该带内为真、带外两侧皆假，
+    不是单调布尔谓词。
+    """
+    band_lo, band_hi = 1, n
+    for pidx, (v, i_meas) in enumerate(points):
+        lo = _first_ge(probe, pidx, v, i_meas - tol, n)
+        if lo is None:
+            return None
+        hi = _last_le(probe, pidx, v, i_meas + tol, n)
+        if hi is None or hi < lo:
+            return None
+        if lo > band_lo:
+            band_lo = lo
+        if hi < band_hi:
+            band_hi = hi
+        if band_hi < band_lo:
+            return None
+    return band_lo, band_hi
 
 
 def diagnose(groups: Sequence[Group], baseline: Sequence[Sequence[str]],
@@ -156,7 +273,7 @@ def diagnose(groups: Sequence[Group], baseline: Sequence[Sequence[str]],
             "within_tolerance": fit,
         })
 
-    # ---- 单组 Isc 退化假设：枚举每组 0.01 网格上的全部小于原值的正数 ----
+    # ---- 单组 Isc 退化假设：逐测点两端搜索，求连续可行 0.01 网格带 ----
     group_results = []
     for g in groups:
         s_idx, pos = string_of_group[g.id]
@@ -164,36 +281,27 @@ def diagnose(groups: Sequence[Group], baseline: Sequence[Sequence[str]],
         # 该组所在串“端电压严格小于其 Voc、仍贡献非零电流”的测点数量
         # （仅用于结果展示；V 恰等于 Voc 时该串恒为零，对组退化不敏感）。
         # 注意：不在此处跳过这些测点——开路支路对总电流贡献 0，
-        # 该组退化不会改变总电流，若实测偏离健康值则候选自然全部落空，
+        # 该组退化不会改变总电流，若实测偏离健康值则可行带自然为空，
         # 不能因“无约束”而真空判为可行。
         sensitive_points = sum(
             1 for v, _ in points if v < base_curves[s_idx].voc - MERGE_EPS)
-        feasible = []
-        for isc_new in _grid_values(g.isc):
-            degraded = Group(g.id, g.voc, isc_new)
-            members = [
-                degraded if k == pos else mg
-                for k, mg in enumerate(base_strings[s_idx])
-            ]
-            curve_new = string_curve(members)
-            ok = True
-            for v, i_meas in points:
-                i_th = total_current(others + [curve_new], v)
-                if not _within(i_th, i_meas, tol):
-                    ok = False
-                    break
-            if ok:
-                feasible.append(isc_new)
         entry = {
             "group": g.id,
             "isc_original": _r(g.isc),
             "sensitive_points": sensitive_points,
-            "feasible": bool(feasible),
+            "feasible": False,
         }
-        if feasible:
-            entry["isc_min"] = _r2(feasible[0])
-            entry["isc_max"] = _r2(feasible[-1])
-            entry["isc_candidates"] = len(feasible)
+        n = _grid_count(g.isc)
+        if n > 0:
+            probe = _DegradedStringProbe(base_strings[s_idx], pos,
+                                         others, points)
+            band = _feasible_band(probe, points, tol, n)
+            if band is not None:
+                lo, hi = band
+                entry["feasible"] = True
+                entry["isc_min"] = _r2(lo * GRID)
+                entry["isc_max"] = _r2(hi * GRID)
+                entry["isc_candidates"] = hi - lo + 1
         group_results.append(entry)
 
     explainable = [e for e in group_results if e["feasible"]]

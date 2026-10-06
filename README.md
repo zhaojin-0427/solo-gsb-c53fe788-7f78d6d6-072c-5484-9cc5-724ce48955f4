@@ -20,9 +20,17 @@ docker compose up --build -d
 启动后访问：
 
 - 应用页面：<http://localhost:8000/>
-- **现场电流偏差诊断页**：<http://localhost:8000/diagnose.html>
+- **现场电流偏差诊断页（批量诊断入口）**：<http://localhost:8000/diagnose.html>
 - 健康检查：<http://localhost:8000/api/health>
 - OpenAPI 文档：<http://localhost:8000/docs>
+
+诊断页底部“添加测点”可连续录入任意多个测点（**至少 3 个**，上限仅受
+请求体大小约束）；提交后页面一次性返回**整批**测点的诊断结果：
+顶部为总体结论框（无法确认异常 / 单组退化 / 多组歧义 / 模型外偏差），
+其下是**全部测点**的健康理论电流、逐点偏差与容差判定表，再下是**每个
+旁路组**的原 Isc、有效测点数、是否可行及逐组最小/最大可行 Isc 与
+0.01 格点取值数。批量接口 `POST /api/trials/{id}/diagnose` 对合法批量
+输入（如 9 组单串、1000 个测点）在服务端 5 秒内返回。
 
 停止：
 
@@ -80,6 +88,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    - 实测端电压 V：有限非负数，**可为零**，且**不超过该记录基线开路电压**；
    - 实测电流 I：有限非负数；
    - 各测点电压**两两互异**。
+   - 少量测点可用“＋ 增加测点”逐行填写；**批量测点**在“批量录入”文本框中
+     每行粘贴一个 `V,I`（空白/逗号分隔，`#` 开头为注释），点
+     “解析批量测点并填入上表”后提交（非法行会就地提示，不上送）。
 3. 点 **提交诊断**，服务端将：
    - 从记录**保存的组参数与基线接线重新构建分段串曲线**求各测点理论电流
      （结果快照只是稀疏采样，**绝不用于插值**；拐点处精确选段，已达到
@@ -102,6 +113,18 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 是否可行与可行退化范围。诊断**只读**记录：不会新增、修改或删除任何试算，
 也不影响原有试算与重开结果。记录不存在返回 `404`；测点或容差非法返回
 `400` 中文错误。
+
+**批量性能与算法**：固定测点电压下，总理论电流随某组退化候选 Isc
+单调不下降（组被旁路、或其所在串已达到 Voc 时出现平台；达到串 Voc 的
+零电流支路仍与实测逐点核对，不视为无约束）。因此每个测点允许的候选
+构成一条连续 0.01 网格带：服务端对每个测点做两次“两端搜索”二分
+（首个电流达下界、末个电流不超上界），再对全部测点取交集，得到每组的
+最小/最大可行 Isc 与格点数；不逐档重建曲线枚举，也不对“全部点合格”
+这一带外两侧皆假的谓词直接布尔二分。退化串曲线按网格下标懒构建并在
+该组各测点间缓存复用，其余串贡献每组只算一次。零容差与旁路拐点沿用
+同一套分段求值与浮点容差，判定与逐档枚举完全一致；9 组单串、1000 测点
+量级的合法批量请求（无论宽容差全可行还是窄容差定位退化）均可在 5 秒内
+完成。
 
 ## 四、电气模型
 
@@ -186,6 +209,18 @@ V_g(I) = max( Voc_g · (1 − I / Isc_g), 0 )
 
 - 至少 3 个测点且电压两两互异；V、I 均为有限非负数，
   V ≤ 该记录基线开路电压；`tolerance` 为有限非负数（可 0）。
+- 测点数量没有额外上限，可整批提交（如 1000 个点）；
+  响应中的 `points` 为与请求同序的逐点明细，`groups` 中每个可行组带
+  `isc_min/isc_max/isc_candidates`（最小、最大可行 Isc 与 0.01 格点数）。
+  用 curl 批量访问结果示例：
+
+  ```bash
+  curl -s http://localhost:8000/api/trials            # 查记录 id
+  curl -s -X POST http://localhost:8000/api/trials/1/diagnose \
+    -H 'Content-Type: application/json' \
+    -d @batch-points.json | python3 -m json.tool      # batch-points.json 即
+                                                      # tolerance + points[]
+  ```
 - 响应含 `verdict`：`unconfirmed`（无法确认异常）、`single_group`
   （单组退化，附 `explainable_groups` 及每组 `isc_min/isc_max/isc_candidates`）、
   `ambiguous`（多组歧义）、`out_of_model`（模型外偏差），以及中文 `message`、
@@ -200,12 +235,20 @@ V_g(I) = max( Voc_g · (1 − I / Isc_g), 0 )
 ├── app/
 │   ├── main.py          # FastAPI：路由、结果序列化、静态页与诊断 API
 │   ├── model.py         # 电气模型、分段 MPP 精确求解、全接线枚举、任意测点理论电流
-│   ├── diagnose.py      # 现场偏差定位：测点校验、健康/单组 Isc 退化假设检验
+│   ├── diagnose.py      # 现场偏差定位：测点校验、健康/单组 Isc 退化假设（两端搜索求可行带）
 │   ├── validation.py    # 入参校验（组数/编号/上下限/小数位/基线完整性）
 │   ├── db.py            # SQLite 存取（JSON 快照，支持重开；诊断只读）
-│   └── static/          # 原生前端（index / diagnose 两个页面 + styles / js）
+│   └── static/          # 原生前端（index / diagnose 两个页面 + styles / js，诊断页支持批量粘贴）
+├── tests/               # 纯标准库验证脚本（不打入镜像）：
+│   ├── bench_diagnose.py     # 两类千点批量场景耗时基准
+│   ├── test_differential.py  # 两端搜索 vs 逐档枚举参考实现的随机差分
+│   ├── test_edge_cases.py    # 零容差/拐点/Voc 零电流支路/夹零等边界
+│   └── test_e2e.py           # DB→校验→诊断调用链、只读性与 400 错误
 ├── data/                # 本地运行时的 SQLite 目录（运行时生成）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
 ```
+
+测试直接用系统 Python 3.11 运行（无需第三方依赖），例如
+`python3 tests/test_differential.py`、`python3 tests/bench_diagnose.py 1000`。
