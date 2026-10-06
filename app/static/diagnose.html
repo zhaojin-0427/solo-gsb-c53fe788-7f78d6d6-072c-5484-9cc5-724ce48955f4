@@ -44,6 +44,16 @@
         <tbody></tbody>
       </table>
     </div>
+    <h3>批量粘贴（可选，适合成百上千个测点）</h3>
+    <p class="hint">每行一个测点，格式 <code>V, I</code>（逗号、空格、Tab 或分号分隔均可，
+      如 <code>12.5, 24.17</code>；也接受 <code>{"v":12.5,"i":24.17}</code>）。
+      粘贴后点<strong>导入表格</strong>即以批量测点提交；清空该框则恢复使用上方表格。</p>
+    <textarea id="bulkPoints" rows="5" style="width:100%;font-family:monospace"
+      placeholder="0.0, 30.0&#10;10.0, 26.67&#10;20.0, 23.33&#10;…（每行一个测点，至少 3 行）"></textarea>
+    <div class="btn-row">
+      <button type="button" id="bulkLoadBtn">导入表格</button>
+      <span id="bulkMeta" class="meta-text"></span>
+    </div>
     <p class="hint">电压电流均须为有限非负数（电压可为零，且不超过所选记录的基线开路电压）；
       每个测点 |实测电流 − 理论电流| ≤ 容差才算被假设解释。</p>
 

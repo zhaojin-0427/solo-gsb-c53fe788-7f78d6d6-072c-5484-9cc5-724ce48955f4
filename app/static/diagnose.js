@@ -91,12 +91,64 @@ function collectPointsRaw() {
   }));
 }
 
+/* 批量文本：每行一个测点，支持 "V, I"（逗号/空格/Tab/分号分隔）或 JSON 对象。
+ * 返回 [{v, i}]（原始字符串，交由 gatherBody 统一做数值校验）。 */
+function parseBulkPoints(text) {
+  const out = [];
+  const lines = text.split(/\r?\n/);
+  lines.forEach((raw, idx) => {
+    const line = raw.trim();
+    if (!line) return;
+    let v = null, i = null;
+    if (line.startsWith("{")) {
+      let obj;
+      try { obj = JSON.parse(line); }
+      catch (e) { throw new Error(`批量测点第 ${idx + 1} 行不是合法的 JSON：${line}`); }
+      if (obj.v === undefined || obj.i === undefined) {
+        throw new Error(`批量测点第 ${idx + 1} 行必须包含 v 和 i：${line}`);
+      }
+      v = String(obj.v); i = String(obj.i);
+    } else {
+      const parts = line.split(/[,\t;，；\s]+/).filter((s) => s !== "");
+      if (parts.length !== 2) {
+        throw new Error(`批量测点第 ${idx + 1} 行应为 “V, I” 两个数：${line}`);
+      }
+      [v, i] = parts;
+    }
+    out.push({ v, i });
+  });
+  return out;
+}
+
+function importBulkPoints() {
+  const text = $("#bulkPoints").value;
+  let parsed;
+  try { parsed = parseBulkPoints(text); }
+  catch (e) { showError(e.message); return; }
+  clearError();
+  if (parsed.length < MIN_POINTS) {
+    showError(`批量测点至少需要 ${MIN_POINTS} 个，当前仅 ${parsed.length} 个`);
+    return;
+  }
+  numPoints = parsed.length;
+  renderPointRows();
+  tbPoints.querySelectorAll("tr").forEach((tr, idx) => {
+    tr.querySelector(".p-v").value = parsed[idx].v;
+    tr.querySelector(".p-i").value = parsed[idx].i;
+  });
+  $("#bulkMeta").textContent = `已导入 ${parsed.length} 个测点`;
+}
+
 function gatherBody() {
   const tolRaw = $("#tolerance").value.trim();
   if (tolRaw === "" || Number.isNaN(Number(tolRaw))) {
     throw new Error("电流容差必须是有限非负数");
   }
-  const points = collectPointsRaw().map((p, idx) => {
+  // 批量框非空时直接以其内容为准，免去先点“导入表格”
+  const rawPoints = $("#bulkPoints").value.trim()
+    ? parseBulkPoints($("#bulkPoints").value)
+    : collectPointsRaw();
+  const points = rawPoints.map((p, idx) => {
     if (p.v === "" || p.i === "" || Number.isNaN(Number(p.v)) || Number.isNaN(Number(p.i))) {
       throw new Error(`第 ${idx + 1} 个测点的电压/电流必须是有限数值`);
     }
@@ -198,6 +250,7 @@ $("#removePointBtn").addEventListener("click", () => {
   numPoints--; renderPointRows();
 });
 $("#diagnoseBtn").addEventListener("click", submitDiagnosis);
+$("#bulkLoadBtn").addEventListener("click", importBulkPoints);
 
 renderPointRows();
 const prefill = new URLSearchParams(location.search).get("id");
